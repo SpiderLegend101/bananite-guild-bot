@@ -1,6 +1,8 @@
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from discord.ui import View, Button
+import io
 import aiohttp
 import os
 import json
@@ -12,6 +14,9 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 GUILD_MEMBER_ROLE_ID = 1473906476904087654
 BANANITE_MEMBER_ROLE_ID = 1449956320051597435
+WELCOME_CHANNEL_ID = 1474036479855431757  # <- hardcoded channel ID
+WELCOME_IMAGE_URL = "https://media1.tenor.com/m/TSVpYwvM-s8AAAAd/xxiisoul-thanos.gif"  # optional image/gif
+GOODBYE_IMAGE_URL = "https://media1.tenor.com/m/eARfzQt-NhQAAAAd/far-cry6-laugh.gif"  # Optional goodbye image/gif
 
 EMOJI_SWORDS = "<:swords:1474004803146223638>"
 EMOJI_DISCORD = "<:discord:1473994882443120735>"
@@ -23,6 +28,7 @@ DB_FILE = "usernames.json"
 
 intents = discord.Intents.default()
 intents.members = True
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -163,10 +169,192 @@ async def profile(interaction: discord.Interaction, user: discord.Member):
 
     await interaction.response.send_message(embed=embed)
 
+# ============================================
+# WELCOME MESSAGE
+# ============================================
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+        guild = after.guild
+        role = guild.get_role(GUILD_MEMBER_ROLE_ID)
+        channel = guild.get_channel(WELCOME_CHANNEL_ID)
+        if not channel or not role:
+            return
+
+        async def send_gif_embed(title: str, description: str, gif_url: str, color: discord.Color):
+            """Downloads a GIF and sends it as an embed attachment."""
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(gif_url) as resp:
+                        if resp.status != 200:
+                            await channel.send(description)  # fallback: just text
+                            return
+                        data = await resp.read()
+
+                embed = discord.Embed(title=title, description=description, color=color)
+                embed.set_image(url="attachment://gif.gif")
+                await channel.send(embed=embed, file=discord.File(io.BytesIO(data), filename="gif.gif"))
+            except Exception as e:
+                print(f"Error sending GIF embed: {e}")
+                await channel.send(description)  # fallback text
+
+        # Member added to Guild Crew
+        if role not in before.roles and role in after.roles:
+            if WELCOME_IMAGE_URL:
+                await send_gif_embed(
+                    title="🎉 Welcome to Bananite Guild!",
+                    description=f"Hope you enjoy your time, {after.mention}!",
+                    gif_url=WELCOME_IMAGE_URL,
+                    color=discord.Color.green()
+                )
+            else:
+                await channel.send(f"🎉 Welcome to Bananite Guild! Hope you enjoy your time, {after.mention}!")
+
+        # Member removed from Guild Crew
+        if role in before.roles and role not in after.roles:
+            if GOODBYE_IMAGE_URL:
+                await send_gif_embed(
+                    title=f"{after.display_name} has left the Guild Crew.",
+                    description="You will not be missed!",
+                    gif_url=GOODBYE_IMAGE_URL,
+                    color=discord.Color.red()
+                )
+            else:
+                await channel.send(f"{after.display_name} has left the Guild Crew. You will not be missed!")
+
+# ======================== CREW INFO ==================
+@bot.tree.command(name="crew_info", description="Show a list of all Guild Crew members (paginated)")
+async def crew_info(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ Could not find the guild.", ephemeral=True)
+        return
+
+    role = guild.get_role(GUILD_MEMBER_ROLE_ID)
+    if not role:
+        await interaction.response.send_message("❌ Guild Crew role not found.", ephemeral=True)
+        return
+
+    data = load_usernames()
+
+    # Exclude bots
+    members_list = [
+        (member, data.get(str(member.id), "Not set"))
+        for member in role.members
+        if not member.bot
+    ]
+
+    if not members_list:
+        await interaction.response.send_message("❌ No members found in Guild Crew.", ephemeral=True)
+        return
+
+    total_members = len(members_list)
+
+    PAGE_SIZE = 8
+    pages = [members_list[i:i + PAGE_SIZE] for i in range(0, len(members_list), PAGE_SIZE)]
+    total_pages = len(pages)
+
+    # ---------------- Create Embed -----------------
+    def create_embed(page_index: int):
+        embed = discord.Embed(
+            title=f"{EMOJI_SWORDS} Bananite Guild Crew",
+            color=role.color
+        )
+
+        embed.description = (
+            f"**Total Crew Members:** `{total_members}`\n"
+            f"━━━━━━━━━━━━━━━━━━"
+        )
+
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+
+        discord_column = []
+        roblox_column = []
+
+        for member, roblox in pages[page_index]:
+            discord_column.append(f"{member.mention}")
+            roblox_column.append(f"`{roblox}`")
+
+        embed.add_field(
+            name=f"{EMOJI_DISCORD} Discord",
+            value="\n".join(discord_column),
+            inline=True
+        )
+
+        embed.add_field(
+            name=f"{EMOJI_ROBLOX} Roblox",
+            value="\n".join(roblox_column),
+            inline=True
+        )
+
+        embed.set_footer(
+            text=f"Bananite Guild Bot 🍌 • Page {page_index+1}/{total_pages}"
+        )
+
+        return embed
+
+    current_page = 0
+    embed = create_embed(current_page)
+
+    # If only one page, no buttons
+    if total_pages == 1:
+        await interaction.response.send_message(embed=embed)
+        return
+
+    # ---------------- Pagination View -----------------
+    class CrewView(View):
+        def __init__(self):
+            super().__init__(timeout=180)
+            self.current_page = 0
+            self.update_buttons()
+
+        def update_buttons(self):
+            self.clear_items()
+
+            if self.current_page > 0:
+                back_button = Button(label="Back", style=discord.ButtonStyle.primary)
+                back_button.callback = self.back_callback
+                self.add_item(back_button)
+
+            if self.current_page < total_pages - 1:
+                next_button = Button(label="Next", style=discord.ButtonStyle.primary)
+                next_button.callback = self.next_callback
+                self.add_item(next_button)
+
+        async def back_callback(self, inter: discord.Interaction):
+            self.current_page -= 1
+            self.update_buttons()
+            await inter.response.edit_message(
+                embed=create_embed(self.current_page),
+                view=self
+            )
+
+        async def next_callback(self, inter: discord.Interaction):
+            self.current_page += 1
+            self.update_buttons()
+            await inter.response.edit_message(
+                embed=create_embed(self.current_page),
+                view=self
+            )
+
+        async def interaction_check(self, inter: discord.Interaction) -> bool:
+            return inter.user == interaction.user
+
+        async def on_timeout(self):
+            for child in self.children:
+                child.disabled = True
+            try:
+                await self.message.edit(view=self)
+            except:
+                pass
+
+    view = CrewView()
+    await interaction.response.send_message(embed=embed, view=view)
+    view.message = await interaction.original_response()
 # ----------------------- STATUS ROTATION -----------------------
 
 statuses = [
-    discord.Game(name="Join Bananite Guild 🍌"),
+    discord.Game(name="Join Bananite Guild"),
     discord.Game(name="discord.gg/bananite")
 ]
 
@@ -176,11 +364,15 @@ async def rotate_status():
         await bot.change_presence(status=discord.Status.dnd, activity=status)
         await asyncio.sleep(30)
 
+GUILD_ID = 1449955287682514976
+
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
+    guild = discord.Object(id=GUILD_ID)
+    await bot.tree.sync(guild=guild)
     rotate_status.start()
     print(f"Logged in as {bot.user}")
+    print(f"testttt in as {bot.user}")
 
 # ----------------------- RUN -----------------------
 
