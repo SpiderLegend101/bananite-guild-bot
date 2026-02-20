@@ -8,6 +8,8 @@ import os
 import json
 import asyncio
 import subprocess
+import base64
+import requests
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -56,29 +58,38 @@ def push_to_github(commit_message):
         return
 
     try:
-        subprocess.run(
-            f"git remote set-url origin https://{GITHUB_TOKEN}@github.com/{GITHUB_REPO}.git",
-            shell=True
-        )
+        # Read the file content
+        with open(DB_FILE, "r") as f:
+            content = f.read()
 
-        subprocess.run("git checkout -B main", shell=True)
-        subprocess.run("git add usernames.json", shell=True)
+        # GitHub API URL for file
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{DB_FILE}"
 
-        commit = subprocess.run(
-            f'git commit -m "{commit_message}"',
-            shell=True,
-            capture_output=True,
-            text=True
-        )
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
 
-        if "nothing to commit" in commit.stdout.lower():
-            print("⚠️ Nothing to commit.")
-            return
+        # Check if file exists to get SHA
+        r = requests.get(url, headers=headers)
+        if r.status_code == 200:
+            sha = r.json()["sha"]
+        else:
+            sha = None
 
-        subprocess.run("git pull origin main --rebase", shell=True)
-        subprocess.run("git push origin main", shell=True)
+        payload = {
+            "message": commit_message,
+            "content": base64.b64encode(content.encode()).decode(),
+            "branch": "main"
+        }
+        if sha:
+            payload["sha"] = sha
 
-        print("✅ GitHub push successful.")
+        r = requests.put(url, headers=headers, json=payload)
+        if r.status_code in [200, 201]:
+            print("✅ GitHub push successful via API")
+        else:
+            print(f"❌ GitHub push failed: {r.status_code} {r.text}")
 
     except Exception as e:
         print(f"GitHub push error: {e}")
